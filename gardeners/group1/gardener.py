@@ -1,230 +1,260 @@
-import math
+import multiprocessing
+import sys
+import time
+from concurrent.futures import ProcessPoolExecutor, TimeoutError, wait
 
+from core.engine import Engine
 from core.garden import Garden
 from core.gardener import Gardener
-from core.micronutrients import Micronutrient
 from core.plants.plant_variety import PlantVariety
-from core.point import Position
+
+
+def _run_strategy_worker(strategy_name, garden_width, garden_height, varieties_data, params):
+    """
+    Worker function to run a single strategy in a separate process.
+    Returns: (strategy_name, score, plant_placements) or None if failed
+    """
+    try:
+        from core.micronutrients import Micronutrient
+        from core.plants.species import Species
+
+        # Import strategy class
+        if strategy_name == 'fixed_k':
+            from gardeners.group1.gardener_fixed_k import Gardener1f as StrategyClass
+        elif strategy_name == 'hybrid':
+            from gardeners.group1.gardener_hybrid import Gardener1h as StrategyClass
+        elif strategy_name == 'mixed_k':
+            from gardeners.group1.gardener_mixed_k import Gardener1m as StrategyClass
+        elif strategy_name == 'prev':
+            from gardeners.group1.gardener_prev import Gardener1Prev as StrategyClass
+        else:
+            return None
+
+        # Reconstruct PlantVariety objects from serialized data
+        varieties = []
+        for v_data in varieties_data:
+            species = Species[v_data['species']]
+            nutrient_coefficients = {
+                Micronutrient[nut_name]: coef
+                for nut_name, coef in v_data['nutrient_coefficients'].items()
+            }
+            variety = PlantVariety(
+                name=v_data['name'],
+                radius=v_data['radius'],
+                species=species,
+                nutrient_coefficients=nutrient_coefficients,
+            )
+            varieties.append(variety)
+
+        # Create test garden
+        test_garden = Garden(garden_width, garden_height)
+
+        # Run strategy
+        gardener = StrategyClass(test_garden, varieties, params)
+        gardener.cultivate_garden()
+
+        # Simulate to measure final growth
+        engine = Engine(test_garden)
+        engine.run_simulation(turns=100)
+
+        # Get results
+        score = test_garden.total_growth()
+
+        # Serialize placements (variety attributes + position)
+        placements = []
+        for plant in test_garden.plants:
+            v = plant.variety
+            placement = {
+                'name': v.name,
+                'radius': v.radius,
+                'species': v.species.name,
+                'nutrient_coefficients': {
+                    nut.name: coef for nut, coef in v.nutrient_coefficients.items()
+                },
+                'position': (plant.position.x, plant.position.y),
+            }
+            placements.append(placement)
+
+        return (strategy_name, score, placements)
+
+    except Exception:
+        # Return error for debugging
+        return (strategy_name, -1, [])  # Negative score indicates failure
 
 
 class Gardener1(Gardener):
-    def __init__(self, garden: Garden, varieties: list[PlantVariety]):
+    """
+    META-STRATEGY: Run 3 best strategies IN PARALLEL and pick the best one.
+
+    Strategies tested (simultaneously):
+    1. Fixed-K: All groups same size (proven baseline)
+    2. Hybrid: Fixed-K + post-optimization
+    3. Mixed-K: Each group can have different size
+
+    Approach:
+    - Launch all 3 strategies in parallel processes
+    - Each runs independently with deadline tracking
+    - Pick strategy with highest growth
+    - Apply winner's placements to actual garden
+    - Total time = max(strategy_times) instead of sum
+    - Hard deadline at 55s to ensure we finish before 60s limit
+    """
+
+    def __init__(self, garden: Garden, varieties: list[PlantVariety], params: dict | None = None):
         super().__init__(garden, varieties)
+        self.params = params
 
-    def _generate_polygonal_grid(self, grid_spacing: float = 1.0) -> list[Position]:
+    def cultivate_garden(self):
         """
-        Generate a polygonal (hexagonal-like) grid of candidate positions.
-        Hexagonal packing is more efficient than square grids for circular plants.
-
-        Args:
-            grid_spacing: Distance between grid points
-
-        Returns:
-            List of Position objects forming a hexagonal grid
+        Meta-strategy: Run all 4 approaches IN PARALLEL and pick the best.
         """
-        positions = []
+        start_time = time.time()
+        hard_deadline = start_time + 55.0  # Must finish by 55s, leave 5s buffer
 
-        # Hexagonal grid uses offset rows
-        # sqrt(3)/2 is around 0.866 is the vertical spacing factor for hex grids
-        hex_height = grid_spacing * math.sqrt(3) / 2
+        # Serialize varieties for multiprocessing (avoid pickling issues)
+        varieties_data = []
+        for v in self.varieties:
+            v_data = {
+                'name': v.name,
+                'radius': v.radius,
+                'species': v.species.name,
+                'nutrient_coefficients': {
+                    nut.name: coef for nut, coef in v.nutrient_coefficients.items()
+                },
+            }
+            varieties_data.append(v_data)
 
-        y = 0
-        row = 0
-        while y <= self.garden.height:
-            # Alternate row offset for hexagonal packing
-            x_offset = (grid_spacing / 2) if row % 2 == 1 else 0
-            x = x_offset
+        # Define strategies to test
+        # Note: 'prev' excluded as it can timeout on large configs
+        strategies = ['fixed_k', 'hybrid', 'mixed_k']
 
-            while x <= self.garden.width:
-                pos = Position(x, y)
-                if self.garden.within_bounds(pos):
-                    positions.append(pos)
-                x += grid_spacing
+        results = {}
 
-            y += hex_height
-            row += 1
+        # Run strategies in parallel using ProcessPoolExecutor
+        # Use 'fork' context on Unix for better compatibility
+        mp_context = multiprocessing.get_context('fork') if sys.platform != 'win32' else None
+        with ProcessPoolExecutor(max_workers=3, mp_context=mp_context) as executor:
+            # Submit all strategies
+            futures = {
+                executor.submit(
+                    _run_strategy_worker,
+                    strategy_name,
+                    self.garden.width,
+                    self.garden.height,
+                    varieties_data,
+                    self.params,
+                ): strategy_name
+                for strategy_name in strategies
+            }
 
-        return positions
+            # Collect results as they complete, respecting hard deadline
+            pending = set(futures.keys())
 
-    def _evaluate_group_balance(self, group: list[PlantVariety]) -> float:
-        """
-        Evaluate how balanced a group is in terms of nutrient production/consumption.
-        Better balance = more sustainable exchanges = better growth.
+            while pending and (time.time() < hard_deadline - 2.0):
+                # Calculate how much time we have left
+                time_left = hard_deadline - time.time() - 1.0
+                if time_left <= 0:
+                    break
 
-        Args:
-            group: List of plant varieties
+                try:
+                    # Wait for futures to complete, with timeout based on remaining time
+                    done, pending = wait(
+                        pending, timeout=min(time_left, 5.0), return_when='FIRST_COMPLETED'
+                    )
 
-        Returns:
-            Score representing group quality (higher is better)
-        """
-        if not group:
-            return 0.0
+                    # Process completed futures
+                    for future in done:
+                        try:
+                            result = future.result(timeout=0.1)
+                            if result:
+                                strategy_name, score, placements = result
+                                # Skip strategies that failed (negative score)
+                                if score > 0:
+                                    results[strategy_name] = {
+                                        'score': score,
+                                        'placements': placements,
+                                    }
+                        except (TimeoutError, Exception):
+                            pass
 
-        # Sum up all nutrient coefficients
-        total_r = sum(v.nutrient_coefficients[Micronutrient.R] for v in group)
-        total_g = sum(v.nutrient_coefficients[Micronutrient.G] for v in group)
-        total_b = sum(v.nutrient_coefficients[Micronutrient.B] for v in group)
+                except (TimeoutError, Exception):
+                    # Timeout or error - use whatever results we have
+                    break
 
-        # Calculate balance score
-        # The more balanced (closer to zero net production), the better
-        # But we also want positive production overall
-        net_production = total_r + total_g + total_b
+        # If no strategies succeeded, use fallback (just place largest plants)
+        if not results:
+            self._fallback_strategy()
+            return
 
-        # Penalize imbalance (variance from mean)
-        mean_nutrient = net_production / 3
-        variance = (
-            (total_r - mean_nutrient) ** 2
-            + (total_g - mean_nutrient) ** 2
-            + (total_b - mean_nutrient) ** 2
-        ) / 3
+        # Pick best strategy based on growth
+        best_strategy = max(results.keys(), key=lambda k: results[k]['score'])
+        best_result = results[best_strategy]
 
-        # Reward positive production, penalize imbalance
-        balance_score = net_production - math.sqrt(variance)
+        # Apply winner's placements to actual garden
+        from core.micronutrients import Micronutrient
+        from core.plants.species import Species
+        from core.point import Position
 
-        return balance_score
+        # Track which varieties have been used (by index in self.varieties list)
+        used_variety_indices = set()
 
-    def _find_optimal_groups_dp(self, k: int) -> list[list[PlantVariety]]:
-        """
-        Use DP to find optimal groups of size k that maximize balance and growth potential.
-        Optimized version with better complexity.
+        for placement_dict in best_result['placements']:
+            # Reconstruct species and nutrients from serialized data
+            species = Species[placement_dict['species']]
+            nutrient_coefficients = {
+                Micronutrient[nut_name]: coef
+                for nut_name, coef in placement_dict['nutrient_coefficients'].items()
+            }
 
-        Args:
-            k: Size of each group
+            # Find matching variety from our list (same species, radius, nutrients)
+            # that hasn't been used yet
+            matching_variety = None
+            matching_index = None
+            for idx, v in enumerate(self.varieties):
+                if idx in used_variety_indices:
+                    continue  # Skip already used varieties
 
-        Returns:
-            List of optimal plant variety groups
-        """
-        n = len(self.varieties)
-
-        if n <= k:
-            # If we don't have enough varieties, return one group
-            return [self.varieties]
-
-        # Simplified approach: greedily form balanced groups
-        groups = []
-        used = set()
-
-        while len(used) < n:
-            remaining = [v for i, v in enumerate(self.varieties) if i not in used]
-
-            if not remaining:
-                break
-
-            group_size = min(k, len(remaining))
-
-            # Use DP only for current group
-            best_score = float('-inf')
-            best_group = None
-
-            def find_group(
-                idx: int, count: int, current: list[int], remaining=remaining, group_size=group_size
-            ) -> None:
-                nonlocal best_score, best_group
-
-                if count == group_size:
-                    group = [remaining[i] for i in current]
-                    score = self._evaluate_group_balance(group)
-                    if score > best_score:
-                        best_score = score
-                        best_group = current[:]
-                    return
-
-                if idx >= len(remaining):
-                    return
-
-                # Take current
-                current.append(idx)
-                find_group(idx + 1, count + 1, current)
-                current.pop()
-
-                # Skip current
-                find_group(idx + 1, count, current)
-
-            find_group(0, 0, [])
-
-            if best_group:
-                group = [remaining[i] for i in best_group]
-                groups.append(group)
-                # Mark as used
-                for variety in group:
-                    for i, v in enumerate(self.varieties):
-                        if v is variety:
-                            used.add(i)
+                if v.species == species and v.radius == placement_dict['radius']:
+                    # Check nutrient coefficients match
+                    nutrients_match = True
+                    for nut, coef in v.nutrient_coefficients.items():
+                        if abs(nutrient_coefficients.get(nut, 0) - coef) > 0.001:
+                            nutrients_match = False
                             break
-            else:
-                break
+                    if nutrients_match:
+                        matching_variety = v
+                        matching_index = idx
+                        break
 
-        return groups
+            if matching_variety:
+                x, y = placement_dict['position']
+                pos = Position(x, y)
+                if self.garden.can_place_plant(matching_variety, pos):
+                    self.garden.add_plant(matching_variety, pos)
+                    used_variety_indices.add(matching_index)  # Mark as used
 
-    def _place_group_on_grid(
-        self, group: list[PlantVariety], grid_positions: list[Position], test_garden: Garden
-    ) -> list[tuple[PlantVariety, Position]]:
+    def _fallback_strategy(self):
         """
-        Try to place a group of plants on the grid in a way that maximizes interactions.
-
-        Args:
-            group: List of plant varieties to place
-            grid_positions: Available grid positions
-            test_garden: Garden instance for testing placement
-
-        Returns:
-            List of (variety, position) tuples for successful placements
+        Emergency fallback if all strategies fail.
+        Just place the largest plants in a simple grid.
         """
-        placements = []
+        # Sort by radius (largest first)
+        sorted_varieties = sorted(self.varieties, key=lambda v: v.radius, reverse=True)
 
-        # Sort plants by radius (larger first) for better packing
-        sorted_group = sorted(group, key=lambda v: v.radius, reverse=True)
+        # Simple grid placement
+        from core.point import Position
 
-        for variety in sorted_group:
-            best_position = None
-            max_neighbors = -1
+        spacing = 10.0
+        x, y = spacing, spacing
 
-            # Try each grid position
-            for pos in grid_positions:
-                if test_garden.can_place_plant(variety, pos):
-                    # Count how many neighbors this position would have
-                    neighbor_count = 0
-                    for placed_variety, placed_pos in placements:
-                        distance = math.sqrt(
-                            (pos.x - placed_pos.x) ** 2 + (pos.y - placed_pos.y) ** 2
-                        )
-                        interaction_distance = variety.radius + placed_variety.radius
-                        if (
-                            distance < interaction_distance
-                            and variety.species != placed_variety.species
-                        ):
-                            neighbor_count += 1
+        for variety in sorted_varieties:
+            if x > self.garden.width - spacing:
+                x = spacing
+                y += spacing
+                if y > self.garden.height - spacing:
+                    break
 
-                    # Prefer positions with more neighbors (more exchanges)
-                    if neighbor_count > max_neighbors:
-                        max_neighbors = neighbor_count
-                        best_position = pos
-
-            if best_position:
-                placements.append((variety, best_position))
-                # Simulate placement in test garden
-                test_garden.add_plant(variety, best_position)
-
-        return placements
-
-    def cultivate_garden(self) -> None:
-        """
-        Place plants strategically using DP-based grouping and polygonal grid placement.
-        """
-        # Generate grid of candidate positions with spacing of 1.0
-        grid_spacing = 1.0
-
-        grid_positions = self._generate_polygonal_grid(grid_spacing)
-
-        # Try different group sizes
-        best_k = 3  # Start with groups of 3 (good for nutrient diversity)
-
-        # Find optimal groups using DP
-        groups = self._find_optimal_groups_dp(best_k)
-
-        # Place each group
-        for group in groups:
-            self._place_group_on_grid(group, grid_positions, self.garden)
-
-            # Actually place in the real garden (already done in _place_group_on_grid)
-            # No need to add again since we passed self.garden directly
+            pos = Position(x, y)
+            if self.garden.can_place_plant(variety, pos):
+                self.garden.add_plant(variety, pos)
+            x += spacing

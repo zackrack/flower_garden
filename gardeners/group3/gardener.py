@@ -28,8 +28,18 @@ class Gardener3(Gardener):
     # Behavior flags
     PREVENT_INTERACTIONS = False
 
+    # Hexagonal placement
+    COUNT_PER_VARIETY_FOR_HEX_PLACEMENT = 8
+    COUNT_EPSILON_FOR_HEX_PLACEMENT = 2
+
     # Minimum varieties count to restrict garden size for hexagonal placement
-    MIN_TOTAL_VARIETIES_COUNT = 24
+    # MIN_TOTAL_VARIETIES_COUNT = 24
+
+    # Params for testing gap filling anchors
+    ANCHOR_GAP_REGEN_THRESHOLD = 100  # Regenerate when below this many gap anchors
+    ANCHOR_GAP_REGEN_N_ROUNDS = 3  # Regenerate after every N gap enriching rounds
+    ANCHOR_GAP_SAMPLE_COUNT = 200  # Sample point count per enrichment
+    ANCHOR_GAP_TOP_N = 100  # Top N gaps to add each time
 
     def __init__(self, garden: Garden, varieties: list[PlantVariety]):
         super().__init__(garden, varieties)
@@ -67,6 +77,12 @@ class Gardener3(Gardener):
 
             print(f'Total varieties available: {len(self.varieties)}')
 
+            # bottleneck detection
+            bottleneck_analysis = self.detect_bottlenecks(species_varieties)
+            print('\nChecking for any inherent bottlenecks...')
+            print(f'Potential Limiting Nutrient: {bottleneck_analysis["limiting_nutrient"]}')
+            print(f'Potential Bottleneck species: {bottleneck_analysis["bottleneck_species"]}')
+
             # Get ranked list of triads
             ranked_triads = self.find_best_triad_permutations(species_varieties)
 
@@ -100,6 +116,117 @@ class Gardener3(Gardener):
                     top_clusters, prevent_interactions=self.PREVENT_INTERACTIONS
                 )
 
+    def detect_bottlenecks(self, species_varieties: dict[Species, list[PlantVariety]]) -> dict:
+        """Checks for any bottlenecks from the JSON being run"""
+        nutrients = [Micronutrient.R, Micronutrient.G, Micronutrient.B]
+        nutrient_names = ['R', 'G', 'B']
+
+        # Flatten all varieties into a list with their data
+        all_varieties = []
+        for _, varieties in species_varieties.items():
+            all_varieties.extend(varieties)
+
+        if not all_varieties:
+            return {
+                'limiting_nutrient': None,
+                'nutrient_balance': {},
+                'ranked_varieties': [],
+                'bottleneck_species': None,
+            }
+
+        # Use magnitude of nutrient coefficients to measure impact of this plant on rest of nutrients
+        variety_data = []
+        for v in all_varieties:
+            rgb_coefficients = [v.nutrient_coefficients[n] for n in nutrients]
+            # R, G, B
+            coeff_array = [rgb_coefficients[0], rgb_coefficients[1], rgb_coefficients[2]]
+            magnitude = math.sqrt(sum(c**2 for c in coeff_array))
+
+            variety_data.append(
+                {
+                    'variety': v,
+                    'name': v.name,
+                    'species': v.species.name,
+                    'coeff_vec': coeff_array,
+                    'magnitude': magnitude,
+                }
+            )
+
+        # Calculate net total nutrient balance(R, G, B)
+        total_net_nutrients = [0.0, 0.0, 0.0]
+        for vd in variety_data:
+            for i in range(3):
+                total_net_nutrients[i] += vd['coeff_vec'][i]
+        # Get lowest nutrient - limiting bottleneck
+        limiting_idx = total_net_nutrients.index(min(total_net_nutrients))
+        limiting_nutrient = nutrient_names[limiting_idx]
+
+        # Calculate how rare each nutrient vector(production/consumption type rates) is
+        for vd in variety_data:
+            # Measures how similar this plant’s nutrient production/consumption is with other existing plants
+            overlaps = [
+                self.cosine_similarity(vd['coeff_vec'], other_variety['coeff_vec'])
+                for other_variety in variety_data
+                if other_variety is not vd
+            ]
+            # High average = plant behaves similarly to many others; low = valuable esp. if produces limiting nutrient
+            avg_overlap = sum(overlaps) / len(overlaps) if overlaps else 0.0
+            vd['avg_overlap'] = avg_overlap
+
+        # Compute bottleneck scores: low overlap + high demand for limiting nutrient = higher bottleneck score
+        # NOTE: play around with values later if have time
+        for vd in variety_data:
+            coeff = vd['coeff_vec']
+            score = (
+                0.5 * vd['magnitude']  # overall measure of how hungry/production heavy plant is
+                + 1.0
+                * abs(
+                    coeff[limiting_idx]
+                )  # demand/production on limiting nutrient - most important so weight highest
+                + 0.5 * (1 - vd['avg_overlap'])  # uniqueness (less overlap = higher bottleneck)
+            )
+            vd['bottleneck_score'] = score
+
+        # Bottleneck scores for each species
+        species_bottleneck_scores = defaultdict(list)
+        for vd in variety_data:
+            species_bottleneck_scores[vd['species']].append(vd['bottleneck_score'])
+        # Average bottleneck score per species
+        species_avg_bottleneck = {
+            species: sum(scores) / len(scores)
+            for species, scores in species_bottleneck_scores.items()
+        }
+
+        # Bottleneck = highest score
+        # currently 0.5, 1, 0.5 weights
+        bottleneck_species = max(species_avg_bottleneck.items(), key=lambda x: x[1])[0]
+
+        # Sort descending
+        bottleneck_scores_desc = sorted(
+            variety_data, key=lambda x: x['bottleneck_score'], reverse=True
+        )
+
+        return {
+            'limiting_nutrient': limiting_nutrient,
+            'nutrient_balance': dict(zip(nutrient_names, total_net_nutrients, strict=False)),
+            'ranked_varieties': [
+                (vd['name'], vd['species'], vd['bottleneck_score']) for vd in bottleneck_scores_desc
+            ],
+            'bottleneck_species': bottleneck_species,
+            'species_bottleneck_scores': species_avg_bottleneck,
+            'variety_data': variety_data,
+        }
+
+    def cosine_similarity(self, a, b):
+        """Used to measure how similar a plant's nutrient production/consumption is to other plants"""
+        dot_product = sum(a[i] * b[i] for i in range(len(a)))
+        magnitude_a = math.sqrt(sum(x**2 for x in a))
+        magnitude_b = math.sqrt(sum(x**2 for x in b))
+        if magnitude_a == 0 or magnitude_b == 0:
+            return 0.0
+
+        return dot_product / (magnitude_a * magnitude_b)
+
     def _check_hexagonal_condition(self) -> bool:
         exactly_three_varieties = len(self.variety_counts) == 3
         equal_counts = all(
@@ -109,38 +236,80 @@ class Gardener3(Gardener):
             variety.radius == list(self.species_varieties.values())[0][0].radius
             for variety in self.varieties
         )
-        return exactly_three_varieties and equal_counts and equal_radii
+        enough_count = all(
+            count >= self.COUNT_PER_VARIETY_FOR_HEX_PLACEMENT
+            for count in self.variety_counts.values()
+        )
+        counts_almost_equal = all(
+            count
+            in range(
+                list(self.variety_counts.values())[0] - self.COUNT_EPSILON_FOR_HEX_PLACEMENT,
+                list(self.variety_counts.values())[0] + self.COUNT_EPSILON_FOR_HEX_PLACEMENT + 1,
+            )
+            for count in self.variety_counts.values()
+        )
+
+        return (
+            exactly_three_varieties
+            and equal_counts
+            and enough_count
+            and counts_almost_equal
+            and equal_radii
+        )
 
     ### Hexagonal Placement Methods ###
 
     def _get_hexagonal_placements(self) -> list:
-        """Generate placements in a hexagonal grid pattern."""
+        """Generate placements in a hexagonal grid pattern, assuming we have one variety per species and all varieties have the same radius and count."""
         placements = []
 
-        if len(self.varieties) <= self.MIN_TOTAL_VARIETIES_COUNT:
-            garden_width, garden_height = self.garden.width // 2, self.garden.height // 2
+        radius = self.varieties[0].radius
+
+        # Compute how many plants can fit in a hexagonal grid with given radius
+        even_row_plants = self.width // radius + 1
+        odd_row_plants = self.width // radius
+
+        even_row_count = (self.height + 1) // (radius * 2) + 1
+        odd_row_count = (
+            (self.height - radius + 1) // (radius * 2) + 1
+            if radius > 1
+            else (self.height - radius + 1) // (radius * 2)
+        )
+
+        total_plants = even_row_plants * even_row_count + odd_row_plants * odd_row_count
+        half_plants = total_plants // 2
+        # print(f'Hexagonal grid can fit up to {total_plants} plants. half: {half_plants}')
+
+        # Use half the garden if we have limited varieties
+        min_count_per_species_for_garden_reduction = half_plants // 3
+        if len(self.varieties) // 3 <= min_count_per_species_for_garden_reduction:
+            garden_width = self.garden.width // 2
+            garden_height = self.garden.height
         else:
             garden_width, garden_height = self.garden.width, self.garden.height
         garden_internal = Garden(garden_width, garden_height)
 
         n_species = len(self.species)
-        offsets = [0.0, 0.5]
-        step_size = 1
+
+        offsets = [0.0, radius / 2.0]
+        step_size = radius
+
         variety_indices = {s: 0 for s in self.species}
 
-        # which species to try next for each row
+        # which species to try next for each row (use row index as key since we use float stepping)
         current_species_by_row = defaultdict(int)
 
-        for y in range(0, self.height + 1, step_size):
-            offset = offsets[y % 2]
+        row_idx = 0
+        for y in self._frange(0.0, self.height + 0.1, step_size):
+            offset = offsets[row_idx % 2]
 
             for x in self._frange(offset, self.width + 0.1, step_size):
                 position = Position(x, y)
 
-                current_species_idx = current_species_by_row[y]
+                current_species_idx = current_species_by_row[row_idx]
                 species_index = (
                     (current_species_idx + 2) % n_species
-                    if y % 2 == 1
+                    if row_idx % 2 == 1
                     else current_species_idx % n_species
                 )
                 species_name = self.species[species_index]
@@ -148,19 +317,20 @@ class Gardener3(Gardener):
                 # skip if we've exhausted varieties for this species
                 if variety_indices[species_name] >= len(self.species_varieties[species_name]):
                     # advance the index because there's nothing left for this species
-                    current_species_by_row[y] = current_species_idx + 1
+                    current_species_by_row[row_idx] = current_species_idx + 1
                     continue
 
                 variety = self.species_varieties[species_name][variety_indices[species_name]]
 
                 if garden_internal.can_place_plant(variety, position):
-                    # print(f"Placing {variety.name} at {position}")
                     placements.append((variety, position))
                     garden_internal.add_plant(variety, position)
                     variety_indices[species_name] += 1
 
                     # advance the index for this row only on successful placement
-                    current_species_by_row[y] = current_species_idx + 1
+                    current_species_by_row[row_idx] = current_species_idx + 1
+
+            row_idx += 1
 
         return placements
 
@@ -200,7 +370,10 @@ class Gardener3(Gardener):
         return species_varieties
 
     def calculate_cluster_score(
-        self, plant_varieties: list[PlantVariety], coordinates: list[Position]
+        self,
+        plant_varieties: list[PlantVariety],
+        coordinates: list[Position],
+        bottleneck_analysis: dict = None,
     ) -> float:
         # Calculate the net production for each nutrient for all plants in cluster
         delta_r_net = sum(plant.nutrient_coefficients[Micronutrient.R] for plant in plant_varieties)
@@ -209,6 +382,22 @@ class Gardener3(Gardener):
 
         # Find the bottleneck
         growth_potential = min(delta_r_net, delta_g_net, delta_b_net)
+
+        # Boost score if cluster produces the limiting nutrient well
+        if bottleneck_analysis:
+            limiting_nutrient = bottleneck_analysis['limiting_nutrient']
+
+            # Boost with bonus based on our bottleneck analysis as we need more
+            if limiting_nutrient == 'R':
+                limiting_production = delta_r_net
+            elif limiting_nutrient == 'G':
+                limiting_production = delta_g_net
+            else:
+                limiting_production = delta_b_net
+
+            # If the plant helps with the limiting nutrient  - encourage growth potential by bonus factor
+            if limiting_production > 0:
+                growth_potential *= 1.0 + 0.5 * limiting_production
 
         # Calculate the Area
         x_min = min(
@@ -237,8 +426,9 @@ class Gardener3(Gardener):
         return growth_potential / area
 
     def find_best_triad_permutations(
-        self, species_varieties: dict[Species, list[PlantVariety]]
+        self, species_varieties: dict[Species, list[PlantVariety]], bottleneck_analysis: dict = None
     ) -> list[ClusterData]:
+        """Finds the best triad clusters to form based on all possible combinations and any bottleneck factors"""
         species_list = list(species_varieties.keys())
         if len(species_list) < 3:
             print('Not enough species to form a triad')
@@ -267,8 +457,10 @@ class Gardener3(Gardener):
                 triad_coordinates = self.find_triad_coordinates(triad_varieties, Position(0, 0))
                 coordinates = [pos for variety, pos in triad_coordinates]
 
-                # Calculate the score for this triad
-                score = self.calculate_cluster_score(triad_varieties, coordinates)
+                # Calculate the score for this triad - including based on any bottleneck factors
+                score = self.calculate_cluster_score(
+                    triad_varieties, coordinates, bottleneck_analysis
+                )
 
                 # Include all triads (including those with negative scores)
                 all_triads.append((triad_varieties, triad_coordinates, score))
@@ -278,7 +470,6 @@ class Gardener3(Gardener):
 
         # Filter to ensure each variety ID appears in only one triad
         unique_triads = self.filter_unique_clusters(all_triads)
-
         # Limit to reasonable number for performance
         top_triads = unique_triads[: self.MAX_TRIAD_PERMUTATIONS]
 
@@ -513,6 +704,8 @@ class Gardener3(Gardener):
         prevent_interactions: bool,
     ) -> None:
         placement_round = 0
+        # Track when last enriched garden with additional anchors in gaps
+        last_enrichment_round = 0
 
         while radius_groups and anchor_points:
             placement_round += 1
@@ -548,16 +741,57 @@ class Gardener3(Gardener):
                 anchor_points = self.remove_anchor_points(anchor_points, placed_plants)
                 print(f'Remaining anchor points: {len(anchor_points)}')
 
+                # Add gap anchors periodically
+                rounds_since_enrichment = placement_round - last_enrichment_round
+
+                # Trigger gap anchor enrichment if either N rounds have passed since last enrichment or anchors are very very low
+                should_enrich = (
+                    rounds_since_enrichment >= self.ANCHOR_GAP_REGEN_N_ROUNDS
+                    or len(anchor_points) < self.ANCHOR_GAP_REGEN_THRESHOLD
+                )
+                if should_enrich and placed_plants:
+                    print('Attempting to fill in major gaps with additional anchors')
+                    gap_anchors = self.locate_major_gaps(
+                        placed_plants, num_samples=self.ANCHOR_GAP_SAMPLE_COUNT
+                    )
+                    # Add top 50 gap anchors
+                    new_points = [(x, y) for x, y, _ in gap_anchors[: self.ANCHOR_GAP_TOP_N]]
+                    anchor_points.extend(new_points)
+                    last_enrichment_round = placement_round
+                    print(f'Added {len(gap_anchors)} potential gap filling anchors')
+
                 # Check if all varieties have been placed - early termination
                 if len(used_varieties) >= total_varieties:
                     print(f'All {total_varieties} varieties have been placed - terminating early')
                     break
             else:
-                # No valid placements for this radius pattern, remove entire radius group
-                print(
-                    f'Radius pattern {best_radius_signature} has no valid placements - removing entire pattern'
-                )
-                del radius_groups[best_radius_signature]
+                # before removing the radius pattern try regenerating anchors anyways
+                if len(anchor_points) < self.ANCHOR_GAP_REGEN_THRESHOLD and placed_plants:
+                    print('Retrying more aggressive gap filling anchors')
+                    # sample more aggressively
+                    gap_anchors = self.locate_major_gaps(
+                        placed_plants, num_samples=self.ANCHOR_GAP_SAMPLE_COUNT * 2
+                    )
+                    anchor_points.extend(
+                        [(x, y) for x, y, _ in gap_anchors[: self.ANCHOR_GAP_TOP_N * 2]]
+                    )
+                    placement_result = self.try_place_cluster(
+                        varieties,
+                        coordinates,
+                        score,
+                        anchor_points,
+                        placed_plants,
+                        used_varieties,
+                        total_varieties,
+                        prevent_interactions,
+                    )
+
+                if not placement_result:
+                    # No valid placements for this radius pattern, remove entire radius group
+                    print(
+                        f'Radius pattern {best_radius_signature} has no valid placements - removing entire pattern'
+                    )
+                    del radius_groups[best_radius_signature]
 
             # If no more anchor points, we're done
             if not anchor_points:
@@ -648,21 +882,56 @@ class Gardener3(Gardener):
 
         return None
 
+    def locate_major_gaps(
+        self, placed_plants: list[tuple[float, float, float, PlantVariety]], num_samples: int = 200
+    ) -> list[tuple[float, float, float]]:
+        """Finds and ranks how big gaps based on currently placed plants in the garden"""
+        if not placed_plants:
+            return self.generate_anchor_points()
+
+        gap_anchors = []
+        # Sample random points and evaluate distance to nearest plant(gap)
+        for _ in range(num_samples):
+            x = random.uniform(0, self.garden.width)
+            y = random.uniform(0, self.garden.height)
+
+            # Find distance to nearest plant
+            nearest = min(
+                math.sqrt((x - px) ** 2 + (y - py) ** 2) - pr for px, py, pr, _ in placed_plants
+            )
+
+            # Keep only points outside all plants(not overlapping with any plant)
+            if nearest > 0:
+                gap_anchors.append((x, y, nearest))
+
+        # Sort by priority (largest gaps first)
+        gap_anchors.sort(key=lambda p: p[2], reverse=True)
+
+        return gap_anchors
+
     def generate_anchor_points(self) -> list[tuple[float, float]]:
+        """Generates anchor points hexagonaly"""
+        # get smallest as they allow denser anchor grids for finer placement control
+        min_radius = min(v.radius for v in self.varieties)
+        # adaptive steps instead of fixed: use percentage of smallest radius, but at least 0.25
+        step = max(0.25, min_radius * 0.4)
+
         anchor_points = []
-        step = self.ANCHOR_POINT_STEP
+        y = 0.0
+        row = 0
+        # go top to bottom
+        while y <= self.garden.height:
+            # offset odd rows by half step to create hexagonal pattern
+            x_offset = (step / 2) if row % 2 == 1 else 0
+            x = x_offset
 
-        # Generate regular grid
-        x = 0.0
-        while x <= self.garden.width:
-            y = 0.0
-            while y <= self.garden.height:
+            while x <= self.garden.width:
                 anchor_points.append((x, y))
-                y += step
-            x += step
+                x += step
 
-        anchor_points = list(set(anchor_points))
-        anchor_points.sort()
+            # hexagonal vertical placing
+            y += step * math.sin(math.radians(60))
+            row += 1
 
         return anchor_points
 
